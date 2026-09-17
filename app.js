@@ -489,21 +489,25 @@
   /* ------------------------------------------------------------------ */
   /* QR CODE SCANNING (works pre-login for both login & signup fields)   */
   /*                                                                     */
-  /* FIXES APPLIED IN THIS VERSION:                                      */
-  /* 1. Explicit window.isSecureContext check — this is the #1 reason    */
-  /*    the browser never shows a permission prompt at all: opening the  */
-  /*    page as file:///... or over plain http:// on a non-localhost     */
-  /*    host disables getUserMedia entirely, and Chrome/Firefox will not */
-  /*    even ask — it just rejects immediately with no dialog.           */
-  /* 2. openQrScanModal() now calls stopQrScanner() BEFORE starting a new */
-  /*    session, so re-opening the modal (or double-clicking the scan    */
-  /*    button) can't leave an old stream/rAF loop running underneath a  */
-  /*    new one.                                                          */
-  /* 3. Progressively looser camera constraints (environment -> user ->  */
-  /*    any) so a laptop/desktop with only one front camera doesn't fail  */
-  /*    with OverconstrainedError before the permission prompt can show. */
-  /* 4. Canvas 2D context is created once and reused instead of being    */
-  /*    re-fetched on every animation frame.                             */
+  /* DECODE ENGINE — PRIORITY ORDER:                                      */
+  /* 1. Native browser "Barcode Detection API" (window.BarcodeDetector). */
+  /*    Chrome/Edge/Brave/most Chromium browsers ship this built in — it */
+  /*    needs ZERO external scripts and ZERO network requests, so it     */
+  /*    can never be broken by a blocked CDN, ad-blocker, firewall, or   */
+  /*    offline network. This is tried FIRST and is what fixes the       */
+  /*    "QR scanner failed to load / check your internet connection"     */
+  /*    error people hit when cdnjs/jsdelivr/unpkg are blocked on their   */
+  /*    network.                                                         */
+  /* 2. jsQR loaded from a script tag (with multi-CDN fallback), used     */
+  /*    ONLY if BarcodeDetector isn't supported (e.g. Firefox, Safari).   */
+  /*                                                                      */
+  /* OTHER FIXES CARRIED FROM EARLIER PASSES:                             */
+  /* - window.isSecureContext check (camera needs https:// or localhost). */
+  /* - openQrScanModal() tears down any previous session before starting  */
+  /*   a new one.                                                         */
+  /* - Progressively looser camera constraints (environment -> user ->    */
+  /*   any) so a single-camera laptop/desktop doesn't fail immediately.   */
+  /* - Canvas 2D context is created once and reused per scan session.     */
   /* ------------------------------------------------------------------ */
 
   let qrStream = null;
@@ -511,9 +515,11 @@
   let qrScanning = false;
   let qrTargetInputId = null;
   let qrCtx = null;
+  let qrDetector = null;       // native BarcodeDetector instance, if used
+  let qrJsQrLoadPromise = null; // cached promise so we don't re-fetch jsQR repeatedly
 
   function openQrScanModal(targetInputId) {
-    // FIX: always tear down any previous scanning session first.
+    // Always tear down any previous scanning session first.
     stopQrScanner();
 
     qrTargetInputId = targetInputId;
@@ -531,6 +537,7 @@
     if (qrStream) { qrStream.getTracks().forEach(function (t) { t.stop(); }); qrStream = null; }
     const video = $("#qrVideo");
     if (video) video.srcObject = null;
+    qrDetector = null;
   }
 
   async function getCameraStream() {
@@ -554,16 +561,43 @@
     throw lastErr;
   }
 
+  // Loads jsQR from a script tag, trying several CDNs in turn. Only used as
+  // a fallback when the native BarcodeDetector API isn't available.
+  function loadJsQrScript() {
+    if (typeof window.jsQR === "function") return Promise.resolve(true);
+    if (qrJsQrLoadPromise) return qrJsQrLoadPromise;
+
+    const urls = [
+      "https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js",
+      "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js",
+      "https://unpkg.com/jsqr@1.4.0/dist/jsQR.js"
+    ];
+
+    qrJsQrLoadPromise = new Promise(function (resolve) {
+      let i = 0;
+      function tryNext() {
+        if (typeof window.jsQR === "function") { resolve(true); return; }
+        if (i >= urls.length) { resolve(false); return; }
+        const s = document.createElement("script");
+        s.src = urls[i];
+        s.onload = function () { resolve(typeof window.jsQR === "function"); };
+        s.onerror = function () { i++; tryNext(); };
+        document.head.appendChild(s);
+      }
+      tryNext();
+    });
+    return qrJsQrLoadPromise;
+  }
+
   async function startQrScanner() {
     const video = $("#qrVideo");
     const canvas = $("#qrCanvas");
     const status = $("#qrScanStatus");
 
-    // FIX #1 — the actual root cause of "browser never asks for permission":
-    // getUserMedia is only available in a secure context (https:// or
-    // http://localhost). If the page was opened as file:///... or a plain
-    // http:// address on a real host, navigator.mediaDevices may not even
-    // exist, or the call rejects instantly with no prompt whatsoever.
+    // Root cause of "browser never asks for permission" at all: getUserMedia
+    // only works in a secure context (https:// or http://localhost). If the
+    // page was opened as file:///... or plain http:// on a real host, the
+    // call rejects instantly with no dialog whatsoever.
     if (!window.isSecureContext) {
       status.textContent = "Camera requires HTTPS or localhost. This page looks like it was opened directly from disk (file://) or over plain HTTP — serve it from a local server (e.g. VS Code 'Live Server', or run `python -m http.server` and open http://localhost:PORT) and try again.";
       status.classList.add("is-error");
@@ -574,10 +608,30 @@
       status.classList.add("is-error");
       return;
     }
-    if (typeof window.jsQR !== "function") {
-      status.textContent = "QR scanner failed to load (check your internet connection). Please enter your Employee ID manually.";
-      status.classList.add("is-error");
-      return;
+
+    // Decide decode engine BEFORE opening the camera: prefer the native,
+    // network-free BarcodeDetector API; only reach for the CDN-hosted jsQR
+    // if that's unavailable in this browser.
+    let engine = null;
+    if (typeof window.BarcodeDetector === "function") {
+      try {
+        const formats = await window.BarcodeDetector.getSupportedFormats();
+        if (formats.indexOf("qr_code") !== -1) {
+          qrDetector = new window.BarcodeDetector({ formats: ["qr_code"] });
+          engine = "native";
+        }
+      } catch (e) { /* fall through to jsQR */ }
+    }
+    if (!engine) {
+      status.textContent = "Loading QR scanner…";
+      const gotJsQr = await loadJsQrScript();
+      if (gotJsQr) {
+        engine = "jsqr";
+      } else {
+        status.textContent = "QR scanner isn't available in this browser and couldn't be loaded from the network. Please enter your Employee ID manually.";
+        status.classList.add("is-error");
+        return;
+      }
     }
 
     try {
@@ -589,7 +643,7 @@
       qrCtx = canvas.getContext("2d", { willReadFrequently: true });
       status.classList.remove("is-error");
       status.textContent = "Point the camera at the QR code on your ID card.";
-      tickQr(video, canvas);
+      tickQr(video, canvas, engine);
     } catch (err) {
       qrStream = null;
       let msg = "Camera access denied or unavailable. Please enter your Employee ID manually.";
@@ -607,8 +661,24 @@
     }
   }
 
-  function tickQr(video, canvas) {
+  async function tickQr(video, canvas, engine) {
     if (!qrScanning) return;
+
+    if (engine === "native") {
+      // Native BarcodeDetector reads directly from the <video> element —
+      // no manual canvas draw / getImageData round-trip needed.
+      try {
+        const codes = await qrDetector.detect(video);
+        if (codes && codes.length && codes[0].rawValue) {
+          handleQrDecoded(codes[0].rawValue, engine);
+          return;
+        }
+      } catch (e) { /* transient decode error, keep scanning */ }
+      qrRafId = requestAnimationFrame(function () { tickQr(video, canvas, engine); });
+      return;
+    }
+
+    // jsQR path — needs a canvas frame + raw pixel data.
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
@@ -618,12 +688,12 @@
         const frame = qrCtx.getImageData(0, 0, canvas.width, canvas.height);
         code = window.jsQR(frame.data, frame.width, frame.height);
       } catch (e) { /* frame not ready */ }
-      if (code && code.data) { handleQrDecoded(code.data); return; }
+      if (code && code.data) { handleQrDecoded(code.data, engine); return; }
     }
-    qrRafId = requestAnimationFrame(function () { tickQr(video, canvas); });
+    qrRafId = requestAnimationFrame(function () { tickQr(video, canvas, engine); });
   }
 
-  function handleQrDecoded(rawText) {
+  function handleQrDecoded(rawText, engine) {
     let empId = String(rawText || "").trim();
     try {
       const parsed = JSON.parse(rawText);
@@ -635,7 +705,7 @@
       const status = $("#qrScanStatus");
       status.textContent = "That QR code isn't a valid Evidentia ID card. Still scanning…";
       status.classList.add("is-error");
-      qrRafId = requestAnimationFrame(function () { tickQr($("#qrVideo"), $("#qrCanvas")); });
+      qrRafId = requestAnimationFrame(function () { tickQr($("#qrVideo"), $("#qrCanvas"), engine); });
       return;
     }
 
