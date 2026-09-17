@@ -476,6 +476,17 @@
 
   /* ------------------------------------------------------------------ */
   /* QR CODE SCANNING (works pre-login for both login & signup fields)   */
+  /*                                                                     */
+  /* NOTE ON THE CAMERA FIX:                                             */
+  /* The previous version requested the camera with an EXACT             */
+  /* facingMode:"environment" constraint. Most laptops/desktops only     */
+  /* expose a single front-facing webcam, so that exact constraint       */
+  /* fails with OverconstrainedError before the browser even shows a     */
+  /* permission prompt — which looked like "the camera never opens".     */
+  /* getCameraStream() now tries a few constraint sets in order and      */
+  /* falls back to a plain camera request, and startQrScanner() reports  */
+  /* a specific reason (permission denied, no camera, camera in use,     */
+  /* no matching camera) instead of one generic message.                */
   /* ------------------------------------------------------------------ */
 
   let qrStream = null;
@@ -497,6 +508,29 @@
     if (qrRafId) cancelAnimationFrame(qrRafId);
     qrRafId = null;
     if (qrStream) { qrStream.getTracks().forEach(function (t) { t.stop(); }); qrStream = null; }
+    const video = $("#qrVideo");
+    if (video) video.srcObject = null;
+  }
+
+  async function getCameraStream() {
+    // Try progressively looser constraints so a desktop/laptop with only
+    // a single front camera (no "environment" facing camera) still works.
+    const attempts = [
+      { video: { facingMode: { ideal: "environment" } } },
+      { video: { facingMode: "user" } },
+      { video: true }
+    ];
+    let lastErr = null;
+    for (let i = 0; i < attempts.length; i++) {
+      try {
+        return await navigator.mediaDevices.getUserMedia(attempts[i]);
+      } catch (err) {
+        lastErr = err;
+        // A hard permission denial won't succeed on retry either — stop immediately.
+        if (err && err.name === "NotAllowedError") throw err;
+      }
+    }
+    throw lastErr;
   }
 
   async function startQrScanner() {
@@ -515,15 +549,29 @@
       status.classList.add("is-error");
       return;
     }
+
     try {
-      qrStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      qrStream = await getCameraStream();
       video.srcObject = qrStream;
+      video.setAttribute("playsinline", "");
       await video.play();
       qrScanning = true;
+      status.classList.remove("is-error");
       status.textContent = "Point the camera at the QR code on your ID card.";
       tickQr(video, canvas, ctx);
     } catch (err) {
-      status.textContent = "Camera access denied or unavailable. Please enter your Employee ID manually.";
+      qrStream = null;
+      let msg = "Camera access denied or unavailable. Please enter your Employee ID manually.";
+      if (err && err.name === "NotAllowedError") {
+        msg = "Camera permission was denied. Allow camera access for this site in your browser settings and try again, or enter your Employee ID manually.";
+      } else if (err && err.name === "NotFoundError") {
+        msg = "No camera was found on this device. Please enter your Employee ID manually.";
+      } else if (err && (err.name === "NotReadableError" || err.name === "TrackStartError")) {
+        msg = "The camera is already in use by another app. Close it and try again, or enter your Employee ID manually.";
+      } else if (err && err.name === "OverconstrainedError") {
+        msg = "Couldn't find a matching camera on this device. Please enter your Employee ID manually.";
+      }
+      status.textContent = msg;
       status.classList.add("is-error");
     }
   }

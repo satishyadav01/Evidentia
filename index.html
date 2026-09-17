@@ -17,14 +17,6 @@
 <div id="loginScreen" class="portal">
 
   <header class="masthead">
-    <div class="seal" aria-hidden="true">
-      <svg viewBox="0 0 120 120" width="56" height="56">
-        <circle cx="60" cy="60" r="56" fill="none" stroke="currentColor" stroke-width="2"/>
-        <circle cx="60" cy="60" r="46" fill="none" stroke="currentColor" stroke-width="1"/>
-        <path d="M60 26 L70 52 L98 52 L75 68 L84 96 L60 78 L36 96 L45 68 L22 52 L50 52 Z"
-              fill="none" stroke="currentColor" stroke-width="1.5"/>
-      </svg>
-    </div>
     <h1 class="portal-title">EVIDENTIA</h1>
     <p class="portal-subtitle">Secure Digital Evidence &amp; Legal Document Management</p>
     <p class="portal-quote">&ldquo;Justice is truth in action — and truth must be kept beyond doubt.&rdquo;</p>
@@ -490,7 +482,7 @@
     <div class="modal-body">
       <p class="muted-text small" style="margin-bottom:10px;">Hold the QR code on your ID card steady in front of the camera.</p>
       <div class="scan-viewport">
-        <video id="qrVideo" playsinline muted></video>
+        <video id="qrVideo" playsinline muted autoplay></video>
         <canvas id="qrCanvas" class="hidden"></canvas>
       </div>
       <p id="qrScanStatus" class="scan-status" aria-live="polite">Requesting camera access…</p>
