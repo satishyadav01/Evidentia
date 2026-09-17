@@ -11,6 +11,18 @@
    - PROTOTYPE ONLY: accounts/passwords live in this file and are checked
      client-side. Production needs server-side hashed auth, real sessions,
      and rate limiting enforced server-side too.
+
+   QR SCANNER FIX NOTES (read this if camera doesn't ask permission):
+   1. Camera ONLY works on https:// or http://localhost. If you open this
+      file directly as file:///... the browser will NEVER show a
+      permission prompt — getUserMedia silently fails. Run this through a
+      local server (VS Code "Live Server", or `python -m http.server`).
+   2. If you already denied camera permission once, the browser will not
+      prompt again automatically — you must allow it manually via the
+      site info / lock icon next to the address bar.
+   3. Every time the scan modal opens we now explicitly stop any previous
+      stream first, so re-opening the modal can't leave a stale camera
+      handle around blocking a new getUserMedia() call.
    ========================================================================== */
 
 (function () {
@@ -477,24 +489,33 @@
   /* ------------------------------------------------------------------ */
   /* QR CODE SCANNING (works pre-login for both login & signup fields)   */
   /*                                                                     */
-  /* NOTE ON THE CAMERA FIX:                                             */
-  /* The previous version requested the camera with an EXACT             */
-  /* facingMode:"environment" constraint. Most laptops/desktops only     */
-  /* expose a single front-facing webcam, so that exact constraint       */
-  /* fails with OverconstrainedError before the browser even shows a     */
-  /* permission prompt — which looked like "the camera never opens".     */
-  /* getCameraStream() now tries a few constraint sets in order and      */
-  /* falls back to a plain camera request, and startQrScanner() reports  */
-  /* a specific reason (permission denied, no camera, camera in use,     */
-  /* no matching camera) instead of one generic message.                */
+  /* FIXES APPLIED IN THIS VERSION:                                      */
+  /* 1. Explicit window.isSecureContext check — this is the #1 reason    */
+  /*    the browser never shows a permission prompt at all: opening the  */
+  /*    page as file:///... or over plain http:// on a non-localhost     */
+  /*    host disables getUserMedia entirely, and Chrome/Firefox will not */
+  /*    even ask — it just rejects immediately with no dialog.           */
+  /* 2. openQrScanModal() now calls stopQrScanner() BEFORE starting a new */
+  /*    session, so re-opening the modal (or double-clicking the scan    */
+  /*    button) can't leave an old stream/rAF loop running underneath a  */
+  /*    new one.                                                          */
+  /* 3. Progressively looser camera constraints (environment -> user ->  */
+  /*    any) so a laptop/desktop with only one front camera doesn't fail  */
+  /*    with OverconstrainedError before the permission prompt can show. */
+  /* 4. Canvas 2D context is created once and reused instead of being    */
+  /*    re-fetched on every animation frame.                             */
   /* ------------------------------------------------------------------ */
 
   let qrStream = null;
   let qrRafId = null;
   let qrScanning = false;
   let qrTargetInputId = null;
+  let qrCtx = null;
 
   function openQrScanModal(targetInputId) {
+    // FIX: always tear down any previous scanning session first.
+    stopQrScanner();
+
     qrTargetInputId = targetInputId;
     openModal("qrScanModal");
     const status = $("#qrScanStatus");
@@ -536,16 +557,25 @@
   async function startQrScanner() {
     const video = $("#qrVideo");
     const canvas = $("#qrCanvas");
-    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     const status = $("#qrScanStatus");
 
+    // FIX #1 — the actual root cause of "browser never asks for permission":
+    // getUserMedia is only available in a secure context (https:// or
+    // http://localhost). If the page was opened as file:///... or a plain
+    // http:// address on a real host, navigator.mediaDevices may not even
+    // exist, or the call rejects instantly with no prompt whatsoever.
+    if (!window.isSecureContext) {
+      status.textContent = "Camera requires HTTPS or localhost. This page looks like it was opened directly from disk (file://) or over plain HTTP — serve it from a local server (e.g. VS Code 'Live Server', or run `python -m http.server` and open http://localhost:PORT) and try again.";
+      status.classList.add("is-error");
+      return;
+    }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      status.textContent = "Camera isn't available here (needs HTTPS or localhost). Please enter your Employee ID manually.";
+      status.textContent = "Camera isn't available in this browser/context. Please enter your Employee ID manually.";
       status.classList.add("is-error");
       return;
     }
     if (typeof window.jsQR !== "function") {
-      status.textContent = "QR scanner failed to load. Please enter your Employee ID manually.";
+      status.textContent = "QR scanner failed to load (check your internet connection). Please enter your Employee ID manually.";
       status.classList.add("is-error");
       return;
     }
@@ -556,14 +586,15 @@
       video.setAttribute("playsinline", "");
       await video.play();
       qrScanning = true;
+      qrCtx = canvas.getContext("2d", { willReadFrequently: true });
       status.classList.remove("is-error");
       status.textContent = "Point the camera at the QR code on your ID card.";
-      tickQr(video, canvas, ctx);
+      tickQr(video, canvas);
     } catch (err) {
       qrStream = null;
       let msg = "Camera access denied or unavailable. Please enter your Employee ID manually.";
       if (err && err.name === "NotAllowedError") {
-        msg = "Camera permission was denied. Allow camera access for this site in your browser settings and try again, or enter your Employee ID manually.";
+        msg = "Camera permission was denied. Allow camera access for this site in your browser settings (click the lock/site-info icon next to the address bar) and try again, or enter your Employee ID manually.";
       } else if (err && err.name === "NotFoundError") {
         msg = "No camera was found on this device. Please enter your Employee ID manually.";
       } else if (err && (err.name === "NotReadableError" || err.name === "TrackStartError")) {
@@ -576,20 +607,20 @@
     }
   }
 
-  function tickQr(video, canvas, ctx) {
+  function tickQr(video, canvas) {
     if (!qrScanning) return;
     if (video.readyState === video.HAVE_ENOUGH_DATA) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      qrCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
       let code = null;
       try {
-        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const frame = qrCtx.getImageData(0, 0, canvas.width, canvas.height);
         code = window.jsQR(frame.data, frame.width, frame.height);
       } catch (e) { /* frame not ready */ }
       if (code && code.data) { handleQrDecoded(code.data); return; }
     }
-    qrRafId = requestAnimationFrame(function () { tickQr(video, canvas, ctx); });
+    qrRafId = requestAnimationFrame(function () { tickQr(video, canvas); });
   }
 
   function handleQrDecoded(rawText) {
@@ -604,9 +635,7 @@
       const status = $("#qrScanStatus");
       status.textContent = "That QR code isn't a valid Evidentia ID card. Still scanning…";
       status.classList.add("is-error");
-      qrRafId = requestAnimationFrame(function () {
-        tickQr($("#qrVideo"), $("#qrCanvas"), $("#qrCanvas").getContext("2d", { willReadFrequently: true }));
-      });
+      qrRafId = requestAnimationFrame(function () { tickQr($("#qrVideo"), $("#qrCanvas")); });
       return;
     }
 
